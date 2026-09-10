@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/entaku0818/aso-compass/backend/internal/model"
 	"github.com/entaku0818/aso-compass/backend/internal/repository"
@@ -65,6 +66,13 @@ func (s *ScraperService) FetchAppInfo(ctx context.Context, bundleID string, plat
 	}
 }
 
+// rankingFetchConcurrency bounds how many keyword lookups run at once. Each
+// lookup streams a ~1.7MB iTunes search response, so this is what decides peak
+// memory for a single UpdateKeywordRankings call — running the whole keyword
+// list sequentially made one request take 20-60s, and running it unbounded
+// would trade that for an OOM.
+const rankingFetchConcurrency = 4
+
 // UpdateKeywordRankings fetches and stores rankings for all keywords of an app
 func (s *ScraperService) UpdateKeywordRankings(ctx context.Context, appID string) (int, error) {
 	app, err := s.appRepo.GetByID(ctx, appID)
@@ -77,31 +85,47 @@ func (s *ScraperService) UpdateKeywordRankings(ctx context.Context, appID string
 		return 0, fmt.Errorf("failed to list keywords: %w", err)
 	}
 
-	updated := 0
+	var (
+		mu      sync.Mutex
+		wg      sync.WaitGroup
+		sem     = make(chan struct{}, rankingFetchConcurrency)
+		updated int
+	)
+
 	for _, keyword := range keywords {
-		var rank *int
-		var err error
+		wg.Add(1)
+		go func(keyword *model.Keyword) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
-		switch app.Platform {
-		case model.PlatformIOS:
-			rank, err = s.appStoreScraper.GetAppRanking(ctx, app.BundleID, keyword.Keyword, keyword.Country)
-		case model.PlatformAndroid:
-			rank, err = s.googlePlayScraper.GetAppRanking(ctx, app.BundleID, keyword.Keyword, keyword.Country)
-		}
+			var rank *int
+			var err error
 
-		if err != nil {
-			continue // Skip failed keywords
-		}
+			switch app.Platform {
+			case model.PlatformIOS:
+				rank, err = s.appStoreScraper.GetAppRanking(ctx, app.BundleID, keyword.Keyword, keyword.Country)
+			case model.PlatformAndroid:
+				rank, err = s.googlePlayScraper.GetAppRanking(ctx, app.BundleID, keyword.Keyword, keyword.Country)
+			}
 
-		_, err = s.rankingRepo.Create(ctx, &model.CreateRankingRequest{
-			KeywordID: keyword.ID,
-			Rank:      rank,
-		})
-		if err != nil {
-			continue
-		}
-		updated++
+			if err != nil {
+				return // Skip failed keywords
+			}
+
+			if _, err := s.rankingRepo.Create(ctx, &model.CreateRankingRequest{
+				KeywordID: keyword.ID,
+				Rank:      rank,
+			}); err != nil {
+				return
+			}
+
+			mu.Lock()
+			updated++
+			mu.Unlock()
+		}(keyword)
 	}
+	wg.Wait()
 
 	return updated, nil
 }

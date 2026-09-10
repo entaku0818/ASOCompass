@@ -184,3 +184,65 @@ func TestAppStoreScraper_Integration(t *testing.T) {
 		}
 	})
 }
+
+func TestITunesRankingResponse_rankOf(t *testing.T) {
+	response := iTunesRankingResponse{
+		Results: []iTunesRankingResult{
+			{BundleID: "com.app1"},
+			{BundleID: "com.app2"},
+			{BundleID: "com.app3"},
+		},
+	}
+
+	tests := []struct {
+		name     string
+		bundleID string
+		want     *int
+	}{
+		{"first result is rank 1", "com.app1", intPtr(1)},
+		{"last result is rank 3", "com.app3", intPtr(3)},
+		{"absent app has no rank", "com.missing", nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := response.rankOf(tt.bundleID)
+			switch {
+			case tt.want == nil && got != nil:
+				t.Errorf("rankOf(%q) = %v, want nil", tt.bundleID, *got)
+			case tt.want != nil && got == nil:
+				t.Errorf("rankOf(%q) = nil, want %v", tt.bundleID, *tt.want)
+			case tt.want != nil && *got != *tt.want:
+				t.Errorf("rankOf(%q) = %v, want %v", tt.bundleID, *got, *tt.want)
+			}
+		})
+	}
+}
+
+func TestITunesRankingResponse_DecodeKeepsOnlyBundleID(t *testing.T) {
+	// The real limit=200 response is ~1.7MB, nearly all of it fields a ranking
+	// lookup never reads. Decoding must skip them rather than materialize them.
+	payload := `{"resultCount":2,"results":[
+		{"trackId":1,"bundleId":"com.other","description":"a very long description","artworkUrl512":"https://example.com/a.png"},
+		{"trackId":2,"bundleId":"com.target","description":"another long description","genres":["Utilities","Productivity"]}
+	]}`
+
+	var result iTunesRankingResponse
+	if err := json.Unmarshal([]byte(payload), &result); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+
+	if len(result.Results) != 2 {
+		t.Fatalf("len(Results) = %d, want 2", len(result.Results))
+	}
+	if result.Results[1].BundleID != "com.target" {
+		t.Errorf("Results[1].BundleID = %q, want %q", result.Results[1].BundleID, "com.target")
+	}
+
+	rank := result.rankOf("com.target")
+	if rank == nil || *rank != 2 {
+		t.Errorf("rankOf(com.target) = %v, want 2", rank)
+	}
+}
+
+func intPtr(v int) *int { return &v }

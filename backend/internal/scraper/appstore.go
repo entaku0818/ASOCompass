@@ -29,6 +29,31 @@ type iTunesSearchResponse struct {
 	Results     []iTunesResult `json:"results"`
 }
 
+// iTunesRankingResponse is a minimal projection of the same response, used when
+// we only need to locate one bundle ID. A limit=200 response is ~1.7MB, nearly
+// all of it descriptions and artwork URLs that a ranking lookup never reads;
+// decoding it into iTunesResult and copying it again into SearchResult was the
+// main source of memory pressure when several keyword updates ran at once.
+type iTunesRankingResponse struct {
+	Results []iTunesRankingResult `json:"results"`
+}
+
+type iTunesRankingResult struct {
+	BundleID string `json:"bundleId"`
+}
+
+// rankOf returns the 1-based position of bundleID in the results, or nil when
+// the app does not appear in them.
+func (r iTunesRankingResponse) rankOf(bundleID string) *int {
+	for i, app := range r.Results {
+		if app.BundleID == bundleID {
+			rank := i + 1
+			return &rank
+		}
+	}
+	return nil
+}
+
 type iTunesResult struct {
 	TrackID                      int64    `json:"trackId"`
 	BundleID                     string   `json:"bundleId"`
@@ -89,6 +114,26 @@ func (s *AppStoreScraper) GetAppInfo(ctx context.Context, bundleID string, count
 
 // SearchKeyword searches for apps with a keyword
 func (s *AppStoreScraper) SearchKeyword(ctx context.Context, keyword string, country string, limit int) ([]SearchResult, error) {
+	var result iTunesSearchResponse
+	if err := s.searchInto(ctx, keyword, country, limit, &result); err != nil {
+		return nil, err
+	}
+
+	results := make([]SearchResult, len(result.Results))
+	for i, app := range result.Results {
+		results[i] = SearchResult{
+			Rank:    i + 1,
+			AppInfo: *s.convertToAppInfo(&app),
+		}
+	}
+
+	return results, nil
+}
+
+// searchInto issues one iTunes search request and decodes the body into out.
+// out decides how much of the response is materialized: SearchKeyword needs
+// every field, GetAppRanking only needs bundleId.
+func (s *AppStoreScraper) searchInto(ctx context.Context, keyword string, country string, limit int, out interface{}) error {
 	if country == "" {
 		country = "jp"
 	}
@@ -108,33 +153,24 @@ func (s *AppStoreScraper) SearchKeyword(ctx context.Context, keyword string, cou
 
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return fmt.Errorf("failed to create request: %w", err)
 	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to search apps: %w", err)
+		return fmt.Errorf("failed to search apps: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	var result iTunesSearchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	results := make([]SearchResult, len(result.Results))
-	for i, app := range result.Results {
-		results[i] = SearchResult{
-			Rank:    i + 1,
-			AppInfo: *s.convertToAppInfo(&app),
-		}
-	}
-
-	return results, nil
+	return nil
 }
 
 // GetReviews fetches reviews using App Store RSS feed
@@ -207,20 +243,13 @@ func (s *AppStoreScraper) GetReviews(ctx context.Context, appID string, country 
 
 // GetAppRanking finds the rank of an app for a specific keyword
 func (s *AppStoreScraper) GetAppRanking(ctx context.Context, bundleID string, keyword string, country string) (*int, error) {
-	results, err := s.SearchKeyword(ctx, keyword, country, 200)
-	if err != nil {
+	var result iTunesRankingResponse
+	if err := s.searchInto(ctx, keyword, country, 200, &result); err != nil {
 		return nil, err
 	}
 
-	for _, result := range results {
-		if result.AppInfo.BundleID == bundleID {
-			rank := result.Rank
-			return &rank, nil
-		}
-	}
-
-	// App not found in search results
-	return nil, nil
+	// nil when the app does not appear in the search results
+	return result.rankOf(bundleID), nil
 }
 
 func (s *AppStoreScraper) convertToAppInfo(result *iTunesResult) *AppInfo {
