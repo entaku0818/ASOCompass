@@ -55,19 +55,25 @@ func TestEvaluateCandidate(t *testing.T) {
 	cfg := DefaultKeywordDiscoveryConfig
 
 	t.Run("already ranking", func(t *testing.T) {
-		ev := evaluateCandidate(results(10000, append(others(11), "com.me")...), "com.me", cfg)
+		ev := evaluateCandidate(results(10000, append(others(11), "com.me")...), "com.me", cfg, false)
 		if !ev.adopt || ev.rank == nil || *ev.rank != 12 {
 			t.Errorf("got %+v, want adopt at rank 12", ev)
 		}
 	})
 	t.Run("out of range but weak competition", func(t *testing.T) {
-		ev := evaluateCandidate(results(20, others(30)...), "com.me", cfg)
+		ev := evaluateCandidate(results(20, others(30)...), "com.me", cfg, true)
 		if !ev.adopt || ev.rank != nil {
 			t.Errorf("got %+v, want adopt with nil rank", ev)
 		}
 	})
+	t.Run("weak competition but unrelated", func(t *testing.T) {
+		ev := evaluateCandidate(results(2, others(30)...), "com.me", cfg, false)
+		if ev.adopt {
+			t.Errorf("got %+v, want reject for an unrelated keyword", ev)
+		}
+	})
 	t.Run("ranked below threshold and strong competition", func(t *testing.T) {
-		ev := evaluateCandidate(results(5000, append(others(80), "com.me")...), "com.me", cfg)
+		ev := evaluateCandidate(results(5000, append(others(80), "com.me")...), "com.me", cfg, true)
 		if ev.adopt {
 			t.Errorf("got %+v, want reject", ev)
 		}
@@ -76,7 +82,7 @@ func TestEvaluateCandidate(t *testing.T) {
 		}
 	})
 	t.Run("too few results", func(t *testing.T) {
-		ev := evaluateCandidate(results(0, others(3)...), "com.me", cfg)
+		ev := evaluateCandidate(results(0, others(3)...), "com.me", cfg, true)
 		if ev.adopt {
 			t.Errorf("got %+v, want reject", ev)
 		}
@@ -228,5 +234,28 @@ func TestDiscoveryRun_SkipsFreeUserAtLimit(t *testing.T) {
 	result, _ := newFakeDiscovery(store, searcher, DefaultKeywordDiscoveryConfig).Run(context.Background())
 	if len(result.Added) != 0 || searcher.calls != 0 {
 		t.Errorf("free app at limit: added=%d searches=%d, want 0", len(result.Added), searcher.calls)
+	}
+}
+
+func TestIsRelevant(t *testing.T) {
+	clipKit := &model.App{Name: "ClipKit - コピー履歴・クリップボード"}
+	terms := relevanceTerms(clipKit, kw("コピペ", "クリップボード 履歴", "エクスポート", "無料"))
+
+	tests := []struct {
+		candidate string
+		want      bool
+	}{
+		{"コピー履歴 アプリ", true},   // contains a title phrase
+		{"クリップボード", true},     // equals a keyword word
+		{"履歴", true},          // contained in a title phrase
+		{"連絡先 エクスポート", false}, // the case that slipped through: 連絡先 is unrelated
+		{"履歴 エクスポート", true},   // every word relates
+		{"誕生日カード 無料", false},  // shares only the generic "無料"
+		{"アプリ 無料", false},
+	}
+	for _, tt := range tests {
+		if got := isRelevant(tt.candidate, terms); got != tt.want {
+			t.Errorf("isRelevant(%q) = %v, want %v (terms %v)", tt.candidate, got, tt.want, terms)
+		}
 	}
 }

@@ -172,6 +172,7 @@ func (s *KeywordDiscoveryService) discoverForApp(ctx context.Context, app *model
 		suggestions = append(suggestions, terms)
 	}
 	candidates := rankCandidates(suggestions, existing, s.cfg.MaxKeywordRunes)
+	relevance := relevanceTerms(app, existing)
 
 	// Validate the best candidates against a real search before adding.
 	added := 0
@@ -188,7 +189,7 @@ func (s *KeywordDiscoveryService) discoverForApp(ctx context.Context, app *model
 			result.Errors = append(result.Errors, fmt.Sprintf("%s: search %q: %v", app.Name, cand, err))
 			continue
 		}
-		ev := evaluateCandidate(results, app.BundleID, s.cfg)
+		ev := evaluateCandidate(results, app.BundleID, s.cfg, isRelevant(cand, relevance))
 		if !ev.adopt {
 			log.Printf("keyword discovery: %s: rejected %q (%s)", app.Name, cand, ev.reason)
 			continue
@@ -333,8 +334,11 @@ type candidateEvaluation struct {
 
 // evaluateCandidate decides from one search whether a keyword is worth
 // tracking: either the app already ranks for it ("取れている語"), or the apps
-// at the top are weak enough to compete with ("取れそうな語").
-func evaluateCandidate(results []scraper.SearchResult, bundleID string, cfg KeywordDiscoveryConfig) candidateEvaluation {
+// at the top are weak enough to compete with ("取れそうな語"). The latter also
+// needs the keyword to be relevant to the app — weak competition alone let in
+// terms like "連絡先 エクスポート" for a clipboard app. Ranking already is
+// Apple's own judgement of relevance, so it needs no extra check.
+func evaluateCandidate(results []scraper.SearchResult, bundleID string, cfg KeywordDiscoveryConfig, relevant bool) candidateEvaluation {
 	var rank *int
 	for i, r := range results {
 		if r.AppInfo.BundleID == bundleID {
@@ -355,12 +359,72 @@ func evaluateCandidate(results []scraper.SearchResult, bundleID string, cfg Keyw
 	if len(results) < cfg.WeakTopN {
 		return candidateEvaluation{rank: rank, reason: fmt.Sprintf("%s・検索結果が%d件しかない", where, len(results))}
 	}
+	if !relevant {
+		return candidateEvaluation{rank: rank, reason: fmt.Sprintf("%s・アプリ名・既存KWと関係のない語を含む", where)}
+	}
 	median := medianRatingCount(results[:cfg.WeakTopN])
 	if median <= cfg.WeakMedianRatings {
 		return candidateEvaluation{adopt: true, rank: rank,
 			reason: fmt.Sprintf("%sだが上位%d本の評価数中央値が%d件（取れそうな語）", where, cfg.WeakTopN, median)}
 	}
 	return candidateEvaluation{rank: rank, reason: fmt.Sprintf("%s・上位%d本の評価数中央値%d件", where, cfg.WeakTopN, median)}
+}
+
+// genericWords appear in titles and keywords of unrelated apps alike, so
+// sharing one says nothing about relevance.
+var genericWords = map[string]bool{
+	"無料": true, "アプリ": true, "おすすめ": true, "人気": true, "ランキング": true,
+	"簡単": true, "かんたん": true, "シンプル": true, "便利": true, "最新": true,
+	"app": true, "apps": true, "free": true, "pro": true, "lite": true, "ai": true,
+}
+
+// relevanceTerms are the words that make a keyword "about" this app: the
+// phrases of its title and the words of its keywords, minus generic ones.
+func relevanceTerms(app *model.App, existing []*model.Keyword) []string {
+	seen := map[string]bool{}
+	var terms []string
+	add := func(phrase string) {
+		for _, w := range strings.Fields(normalizeKeyword(phrase)) {
+			if utf8.RuneCountInString(w) < 2 || genericWords[w] || seen[w] {
+				continue
+			}
+			seen[w] = true
+			terms = append(terms, w)
+		}
+	}
+	for _, part := range strings.Split(titleSeparators.Replace(app.Name), "\n") {
+		add(part)
+	}
+	for _, k := range existing {
+		add(k.Keyword)
+	}
+	return terms
+}
+
+// isRelevant reports whether every non-generic word of a candidate is about
+// the app: each must contain a relevance term or be contained in one (Japanese
+// has no spaces, so "録音" must match "録音アプリ" and "シンプル録音" alike).
+// Requiring every word, not just one, is what rejects "連絡先 エクスポート"
+// for a clipboard app that tracks "エクスポート".
+func isRelevant(candidate string, terms []string) bool {
+	matchedAny := false
+	for _, w := range strings.Fields(normalizeKeyword(candidate)) {
+		if utf8.RuneCountInString(w) < 2 || genericWords[w] {
+			continue
+		}
+		matched := false
+		for _, t := range terms {
+			if strings.Contains(w, t) || strings.Contains(t, w) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+		matchedAny = true
+	}
+	return matchedAny
 }
 
 func medianRatingCount(results []scraper.SearchResult) int {
