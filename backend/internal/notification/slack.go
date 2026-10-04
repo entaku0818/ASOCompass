@@ -57,25 +57,35 @@ type SlackAttachment struct {
 
 // BatchResult holds the result of a batch job execution
 type BatchResult struct {
-	JobType           string
-	Success           bool
-	StartTime         time.Time
-	EndTime           time.Time
-	AppsProcessed     int
-	KeywordsUpdated   int
-	TrackedKeywords   int
-	RankingChanges    []RankingChange
-	Errors            []string
+	JobType         string
+	Success         bool
+	StartTime       time.Time
+	EndTime         time.Time
+	AppsProcessed   int
+	KeywordsUpdated int
+	TrackedKeywords int
+	// KeywordsFailed / TrackedKeywordsFailed count keywords whose fetch failed.
+	// Any failure makes the run unsuccessful: a run that silently skipped
+	// keywords used to be reported as success for weeks.
+	KeywordsFailed        int
+	TrackedKeywordsFailed int
+	RankingChanges        []RankingChange
+	Errors                []string
+}
+
+// Finalize decides Success from what the run recorded.
+func (r *BatchResult) Finalize() {
+	r.Success = len(r.Errors) == 0 && r.KeywordsFailed == 0 && r.TrackedKeywordsFailed == 0
 }
 
 // RankingChange represents a significant ranking change
 type RankingChange struct {
-	AppName     string
-	Keyword     string
-	Country     string
-	OldRank     *int
-	NewRank     *int
-	ChangeType  string // "improved", "declined", "new_ranking", "dropped_out"
+	AppName    string
+	Keyword    string
+	Country    string
+	OldRank    *int
+	NewRank    *int
+	ChangeType string // "improved", "declined", "new_ranking", "dropped_out"
 }
 
 // Send sends a raw message to Slack
@@ -137,6 +147,16 @@ func (s *SlackNotifier) SendBatchResult(result *BatchResult) error {
 				{Type: "mrkdwn", Text: fmt.Sprintf("*Keywords Updated:*\n%d", result.KeywordsUpdated)},
 			},
 		},
+	}
+
+	if result.KeywordsFailed > 0 || result.TrackedKeywordsFailed > 0 {
+		blocks = append(blocks, SlackBlock{
+			Type: "section",
+			Fields: []SlackText{
+				{Type: "mrkdwn", Text: fmt.Sprintf("*Keywords Failed:*\n%d", result.KeywordsFailed)},
+				{Type: "mrkdwn", Text: fmt.Sprintf("*Tracked Keywords Failed:*\n%d", result.TrackedKeywordsFailed)},
+			},
+		})
 	}
 
 	if result.TrackedKeywords > 0 {

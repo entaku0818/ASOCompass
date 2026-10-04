@@ -35,6 +35,19 @@ var migration015 string
 //go:embed migrations/016_search_keyword_reports.up.sql
 var migration016 string
 
+// The iTunes Search API starts refusing requests at roughly 20 per minute. All
+// searches of a run (keyword rankings and tracked keywords) share one limiter
+// at that pace: ~200 ranking keywords + ~210 tracked keywords is ~410
+// searches, i.e. ~21 minutes.
+const itunesSearchInterval = 3 * time.Second
+
+// itunesSearchBudget caps how long the iTunes-search phases may run, counted
+// from batch start, so that a slow run ends with its unfinished keywords
+// reported as failures instead of being killed by the Cloud Run task timeout
+// (30m) before it can report anything. The remaining minutes are for
+// store-rankings (~2m) and keyword-cache.
+const itunesSearchBudget = 25 * time.Minute
+
 func main() {
 	ctx := context.Background()
 	startTime := time.Now()
@@ -103,6 +116,9 @@ func main() {
 		appRepo,
 		trackedKeywordRepo,
 	)
+	scraperService.SetSearchRateLimiter(scraper.NewRateLimiter(itunesSearchInterval))
+	searchCtx, cancelSearch := context.WithDeadline(ctx, startTime.Add(itunesSearchBudget))
+	defer cancelSearch()
 
 	storeRankingRepo := repository.NewStoreRankingRepository(pool)
 	appRankingService := service.NewAppRankingService(storeRankingRepo)
@@ -130,9 +146,10 @@ func main() {
 	case "seed":
 		runSeed(ctx, pool)
 	case "rankings":
-		apps, keywords, errs := runRankingsUpdate(ctx, scraperService)
+		apps, keywords, failed, errs := runRankingsUpdate(searchCtx, scraperService)
 		result.AppsProcessed = apps
 		result.KeywordsUpdated = keywords
+		result.KeywordsFailed = failed
 		result.Errors = append(result.Errors, errs...)
 		// Detect ranking changes after update
 		changes, _ := rankingChangeService.DetectChanges(ctx)
@@ -144,24 +161,28 @@ func main() {
 			result.Errors = append(result.Errors, e.Error())
 		}
 	case "tracked-keywords":
-		tracked, errs := runTrackedKeywordsUpdate(ctx, scraperService)
+		tracked, failed, errs := runTrackedKeywordsUpdate(searchCtx, scraperService)
 		result.TrackedKeywords = tracked
+		result.TrackedKeywordsFailed = failed
 		result.Errors = append(result.Errors, errs...)
 	case "keyword-cache":
 		cached, errs := runKeywordCacheUpdate(ctx, keywordCacheRepo)
 		result.KeywordsUpdated = cached
 		result.Errors = append(result.Errors, errs...)
 	case "all":
-		apps, keywords, errs := runRankingsUpdate(ctx, scraperService)
+		// Rankings go first so they get the search budget before tracked keywords.
+		apps, keywords, failed, errs := runRankingsUpdate(searchCtx, scraperService)
 		result.AppsProcessed = apps
 		result.KeywordsUpdated = keywords
+		result.KeywordsFailed = failed
 		result.Errors = append(result.Errors, errs...)
 		// Detect ranking changes after update
 		changes, _ := rankingChangeService.DetectChanges(ctx)
 		result.RankingChanges = changes
 
-		tracked, trackedErrs := runTrackedKeywordsUpdate(ctx, scraperService)
+		tracked, trackedFailed, trackedErrs := runTrackedKeywordsUpdate(searchCtx, scraperService)
 		result.TrackedKeywords = tracked
+		result.TrackedKeywordsFailed = trackedFailed
 		result.Errors = append(result.Errors, trackedErrs...)
 
 		saved, storeErrs := runStoreRankingsFetch(ctx, appRankingService)
@@ -178,9 +199,7 @@ func main() {
 	}
 
 	result.EndTime = time.Now()
-	if len(result.Errors) > 0 {
-		result.Success = false
-	}
+	result.Finalize()
 
 	// Send Slack notification
 	if slackNotifier.IsConfigured() && (job == "all" || job == "rankings" || job == "tracked-keywords") {
@@ -191,38 +210,51 @@ func main() {
 		}
 	}
 
+	if !result.Success {
+		// Exit non-zero so the Cloud Run execution and the GitHub Actions run
+		// show the failure instead of reporting success for a partial run.
+		log.Printf("Batch job finished with failures: %d keywords failed, %d tracked keywords failed, %d errors",
+			result.KeywordsFailed, result.TrackedKeywordsFailed, len(result.Errors))
+		os.Exit(1)
+	}
 	log.Println("Batch job completed successfully")
 }
 
-func runRankingsUpdate(ctx context.Context, s *service.ScraperService) (int, int, []string) {
+func runRankingsUpdate(ctx context.Context, s *service.ScraperService) (int, int, int, []string) {
 	log.Println("Starting rankings update...")
 	var errors []string
 
-	results, err := s.TriggerAllUpdates(ctx)
+	result, err := s.TriggerAllUpdates(ctx)
 	if err != nil {
 		log.Printf("Error updating rankings: %v", err)
 		errors = append(errors, fmt.Sprintf("Rankings update error: %v", err))
-		return 0, 0, errors
+		return 0, 0, 0, errors
 	}
 
-	total := 0
 	failedApps := 0
-	for appID, count := range results {
-		if count >= 0 {
-			total += count
-			log.Printf("App %s: %d keywords updated", appID, count)
-		} else {
-			log.Printf("App %s: failed", appID)
-			errors = append(errors, fmt.Sprintf("App %s: failed to update", appID))
+	for appID, app := range result.Apps {
+		if app.Err != nil {
+			log.Printf("App %q (%s): failed to list keywords: %v", app.AppName, appID, app.Err)
+			errors = append(errors, fmt.Sprintf("App %s: failed to list keywords: %v", app.AppName, app.Err))
 			failedApps++
+			continue
+		}
+		log.Printf("App %q (%s): %d/%d keywords updated, %d failed", app.AppName, appID, app.Updated, app.Keywords, app.Failed)
+	}
+
+	if result.Failed > 0 {
+		errors = append(errors, fmt.Sprintf("Rankings: %d of %d keywords failed (%s)",
+			result.Failed, result.Updated+result.Failed, service.SummarizeFailureStatuses(result.Failures)))
+		for _, f := range result.Failures {
+			errors = append(errors, f.String())
 		}
 	}
 
-	fmt.Printf("Rankings update complete: %d total keywords updated across %d apps\n", total, len(results))
-	return len(results) - failedApps, total, errors
+	fmt.Printf("Rankings update complete: %d total keywords updated across %d apps (%d failed)\n", result.Updated, len(result.Apps), result.Failed)
+	return len(result.Apps) - failedApps, result.Updated, result.Failed, errors
 }
 
-func runTrackedKeywordsUpdate(ctx context.Context, s *service.ScraperService) (int, []string) {
+func runTrackedKeywordsUpdate(ctx context.Context, s *service.ScraperService) (int, int, []string) {
 	log.Println("Starting tracked keywords update...")
 	var errors []string
 
@@ -230,22 +262,23 @@ func runTrackedKeywordsUpdate(ctx context.Context, s *service.ScraperService) (i
 	if err != nil {
 		log.Printf("Error updating tracked keywords: %v", err)
 		errors = append(errors, fmt.Sprintf("Tracked keywords error: %v", err))
-		return 0, errors
+		return 0, 0, errors
 	}
 
 	total := 0
+	failed := 0
 	for keywordID, count := range results {
 		if count >= 0 {
 			total += count
 			log.Printf("Tracked keyword %s: %d results", keywordID, count)
 		} else {
-			log.Printf("Tracked keyword %s: failed", keywordID)
 			errors = append(errors, fmt.Sprintf("Tracked keyword %s: failed", keywordID))
+			failed++
 		}
 	}
 
-	fmt.Printf("Tracked keywords update complete: %d total results across %d keywords\n", total, len(results))
-	return total, errors
+	fmt.Printf("Tracked keywords update complete: %d total results across %d keywords (%d failed)\n", total, len(results), failed)
+	return total, failed, errors
 }
 
 func runStoreRankingsFetch(ctx context.Context, svc *service.AppRankingService) (int, []error) {

@@ -54,7 +54,7 @@ func (h *ScraperHandler) UpdateRankings(w http.ResponseWriter, r *http.Request) 
 	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"message":         "rankings updated",
+		"message":          "rankings updated",
 		"keywords_updated": count,
 	})
 }
@@ -141,23 +141,24 @@ func (h *ScraperHandler) TriggerAllUpdates(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	totalApps := len(results)
-	totalKeywords := 0
 	failedApps := 0
-	for _, count := range results {
-		if count < 0 {
+	details := make(map[string]int, len(results.Apps))
+	for appID, app := range results.Apps {
+		if app.Err != nil {
 			failedApps++
-		} else {
-			totalKeywords += count
+			details[appID] = -1
+			continue
 		}
+		details[appID] = app.Updated
 	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"message":          "update completed",
-		"apps_processed":   totalApps,
-		"keywords_updated": totalKeywords,
+		"apps_processed":   len(results.Apps),
+		"keywords_updated": results.Updated,
+		"keywords_failed":  results.Failed,
 		"failed_apps":      failedApps,
-		"details":          results,
+		"details":          details,
 	})
 }
 

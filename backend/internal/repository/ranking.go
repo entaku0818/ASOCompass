@@ -336,3 +336,29 @@ func (r *RankingRepository) GetAllKeywordRanks(ctx context.Context, appID string
 
 	return summarizeKeywordRanks(raw), nil
 }
+
+// LastRecordedAtByKeyword returns, for every keyword that has any ranking
+// history, when its latest ranking was recorded. The batch uses it to fetch
+// the stalest keywords first.
+func (r *RankingRepository) LastRecordedAtByKeyword(ctx context.Context) (map[string]time.Time, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT keyword_id, MAX(recorded_at)
+		FROM ranking_history
+		GROUP BY keyword_id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	last := make(map[string]time.Time)
+	for rows.Next() {
+		var keywordID string
+		var recordedAt time.Time
+		if err := rows.Scan(&keywordID, &recordedAt); err != nil {
+			return nil, err
+		}
+		last[keywordID] = recordedAt
+	}
+	return last, rows.Err()
+}

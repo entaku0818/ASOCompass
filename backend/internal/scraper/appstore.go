@@ -3,15 +3,40 @@ package scraper
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 )
 
+const defaultSearchURL = "https://itunes.apple.com/search"
+
 // AppStoreScraper implements Scraper for Apple App Store
 type AppStoreScraper struct {
-	client *http.Client
+	client    *http.Client
+	searchURL string
+	// limiter is shared by every search this scraper issues; nil means
+	// unlimited. The batch sets one so that all jobs hitting the iTunes Search
+	// API in a run stay under its rate limit together.
+	limiter *RateLimiter
+	retry   retryPolicy
+}
+
+// retryPolicy decides how often a rejected search is retried. Waits double
+// from baseDelay on each attempt (5s, 10s, 20s with the defaults), unless the
+// server asks for longer via Retry-After.
+type retryPolicy struct {
+	maxAttempts int
+	baseDelay   time.Duration
+	maxDelay    time.Duration
+}
+
+var defaultSearchRetry = retryPolicy{
+	maxAttempts: 4,
+	baseDelay:   5 * time.Second,
+	maxDelay:    60 * time.Second,
 }
 
 // NewAppStoreScraper creates a new App Store scraper
@@ -20,7 +45,62 @@ func NewAppStoreScraper() *AppStoreScraper {
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		searchURL: defaultSearchURL,
+		retry:     defaultSearchRetry,
 	}
+}
+
+// SetRateLimiter makes every subsequent search wait on l before each attempt.
+func (s *AppStoreScraper) SetRateLimiter(l *RateLimiter) {
+	s.limiter = l
+}
+
+// HTTPStatusError is returned when the store answers with a non-200 status,
+// so callers can log and classify failures by status code.
+type HTTPStatusError struct {
+	StatusCode int
+	retryAfter time.Duration
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("unexpected status code: %d", e.StatusCode)
+}
+
+// StatusCodeOf returns the HTTP status behind err, or 0 when err did not come
+// from a non-200 response (network error, decode error, ...).
+func StatusCodeOf(err error) int {
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.StatusCode
+	}
+	return 0
+}
+
+// isRetryableStatus reports whether a status means "try again later". iTunes
+// signals its rate limit with 403 as well as 429, so 403 is retried too.
+func isRetryableStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code == http.StatusForbidden || code >= 500
+}
+
+// backoff returns how long to wait before the attempt after `attempt`
+// (1-based), preferring the server's Retry-After when it is longer.
+func (p retryPolicy) backoff(attempt int, retryAfter time.Duration) time.Duration {
+	d := p.baseDelay << (attempt - 1)
+	if retryAfter > d {
+		d = retryAfter
+	}
+	if p.maxDelay > 0 && d > p.maxDelay {
+		d = p.maxDelay
+	}
+	return d
+}
+
+func parseRetryAfter(v string) time.Duration {
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // iTunes Search API response structures
@@ -55,22 +135,22 @@ func (r iTunesRankingResponse) rankOf(bundleID string) *int {
 }
 
 type iTunesResult struct {
-	TrackID                      int64    `json:"trackId"`
-	BundleID                     string   `json:"bundleId"`
-	TrackName                    string   `json:"trackName"`
-	ArtistName                   string   `json:"artistName"`
-	Price                        float64  `json:"price"`
-	Currency                     string   `json:"currency"`
-	AverageUserRating            float64  `json:"averageUserRating"`
-	UserRatingCount              int      `json:"userRatingCount"`
-	Version                      string   `json:"version"`
-	TrackViewURL                 string   `json:"trackViewUrl"`
-	ArtworkURL512                string   `json:"artworkUrl512"`
-	Description                  string   `json:"description"`
-	ReleaseDate                  string   `json:"releaseDate"`
-	PrimaryGenreName             string   `json:"primaryGenreName"`
-	Genres                       []string `json:"genres"`
-	CurrentVersionReleaseDate    string   `json:"currentVersionReleaseDate"`
+	TrackID                   int64    `json:"trackId"`
+	BundleID                  string   `json:"bundleId"`
+	TrackName                 string   `json:"trackName"`
+	ArtistName                string   `json:"artistName"`
+	Price                     float64  `json:"price"`
+	Currency                  string   `json:"currency"`
+	AverageUserRating         float64  `json:"averageUserRating"`
+	UserRatingCount           int      `json:"userRatingCount"`
+	Version                   string   `json:"version"`
+	TrackViewURL              string   `json:"trackViewUrl"`
+	ArtworkURL512             string   `json:"artworkUrl512"`
+	Description               string   `json:"description"`
+	ReleaseDate               string   `json:"releaseDate"`
+	PrimaryGenreName          string   `json:"primaryGenreName"`
+	Genres                    []string `json:"genres"`
+	CurrentVersionReleaseDate string   `json:"currentVersionReleaseDate"`
 }
 
 // GetAppInfo fetches app information by bundle ID
@@ -145,12 +225,59 @@ func (s *AppStoreScraper) searchInto(ctx context.Context, keyword string, countr
 	}
 
 	apiURL := fmt.Sprintf(
-		"https://itunes.apple.com/search?term=%s&country=%s&media=software&limit=%d",
+		"%s?term=%s&country=%s&media=software&limit=%d",
+		s.searchURL,
 		url.QueryEscape(keyword),
 		url.QueryEscape(country),
 		limit,
 	)
 
+	attempts := s.retry.maxAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err := s.limiter.Wait(ctx); err != nil {
+			return err
+		}
+
+		err := s.searchOnce(ctx, apiURL, out)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+
+		var statusErr *HTTPStatusError
+		var retryAfter time.Duration
+		switch {
+		case ctx.Err() != nil:
+			return err
+		case errors.As(err, &statusErr):
+			if !isRetryableStatus(statusErr.StatusCode) {
+				return err
+			}
+			retryAfter = statusErr.retryAfter
+		}
+
+		if attempt == attempts {
+			break
+		}
+
+		timer := time.NewTimer(s.retry.backoff(attempt, retryAfter))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("%w (gave up waiting to retry: %v)", lastErr, ctx.Err())
+		case <-timer.C:
+		}
+	}
+
+	return fmt.Errorf("after %d attempts: %w", attempts, lastErr)
+}
+
+func (s *AppStoreScraper) searchOnce(ctx context.Context, apiURL string, out interface{}) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
@@ -163,7 +290,10 @@ func (s *AppStoreScraper) searchInto(ctx context.Context, keyword string, countr
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return &HTTPStatusError{
+			StatusCode: resp.StatusCode,
+			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {

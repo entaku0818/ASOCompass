@@ -86,7 +86,7 @@ jobs:
               --memory 512Mi \
               --cpu 1 \
               --task-timeout 30m \
-              --max-retries 1
+              --max-retries 0
           else
             echo "Creating new job..."
             gcloud run jobs create aso-batch \
@@ -97,7 +97,7 @@ jobs:
               --memory 512Mi \
               --cpu 1 \
               --task-timeout 30m \
-              --max-retries 1
+              --max-retries 0
           fi
 
       - name: Execute batch job
