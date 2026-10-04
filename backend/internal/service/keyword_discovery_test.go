@@ -39,7 +39,7 @@ func others(n int) []string {
 func TestRankCandidates(t *testing.T) {
 	suggestions := [][]string{
 		{"録音 アプリ", "ボイスメモ", "議事録", "文字起こしさん: 音声入力でテキスト変換"},
-		{"ボイスメモ", "録音 無料", "Voice Memo | 録音"},
+		{"ボイスメモ", "録音 無料", "Voice Memo | 録音", "speedmeter .."},
 	}
 	got := rankCandidates(suggestions, kw("議事録"), 15)
 

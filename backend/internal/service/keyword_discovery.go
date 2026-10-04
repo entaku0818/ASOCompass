@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/entaku0818/aso-compass/backend/internal/model"
@@ -311,7 +312,17 @@ func looksLikeAppName(term string, maxRunes int) bool {
 	if utf8.RuneCountInString(strings.TrimSpace(term)) > maxRunes {
 		return true
 	}
-	return strings.ContainsAny(term, ":：|｜") || strings.Contains(term, " - ")
+	if strings.ContainsAny(term, ":：|｜") || strings.Contains(term, " - ") {
+		return true
+	}
+	// Suggestions like "speedmeter .." carry punctuation-only words that
+	// nobody searches for.
+	for _, word := range strings.Fields(term) {
+		if !strings.ContainsFunc(word, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) {
+			return true
+		}
+	}
+	return false
 }
 
 type candidateEvaluation struct {
