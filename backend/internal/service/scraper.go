@@ -347,7 +347,10 @@ func (s *ScraperService) TriggerAllUpdates(ctx context.Context) (*RankingUpdateR
 	return result, nil
 }
 
-// UpdateTrackedKeywordResults fetches and stores search results for all tracked keywords
+// UpdateTrackedKeywordResults fetches and stores search results for all
+// tracked keywords, rankingFetchConcurrency at a time. Running them one by one
+// took ~4.7s per keyword (the response time, longer than the rate limiter's
+// spacing), which no longer fit the batch's search budget.
 func (s *ScraperService) UpdateTrackedKeywordResults(ctx context.Context) (map[string]int, error) {
 	if s.trackedKeywordRepo == nil {
 		return nil, fmt.Errorf("tracked keyword repository not configured")
@@ -358,48 +361,32 @@ func (s *ScraperService) UpdateTrackedKeywordResults(ctx context.Context) (map[s
 		return nil, fmt.Errorf("failed to list tracked keywords: %w", err)
 	}
 
-	results := make(map[string]int)
+	var (
+		mu      sync.Mutex
+		wg      sync.WaitGroup
+		sem     = make(chan struct{}, rankingFetchConcurrency)
+		results = make(map[string]int, len(trackedKeywords))
+	)
 	for _, tk := range trackedKeywords {
-		var searchResults []scraper.SearchResult
-		var searchErr error
+		wg.Add(1)
+		go func(tk *repository.TrackedKeyword) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
-		platform := model.Platform(tk.Platform)
-		switch platform {
-		case model.PlatformIOS:
-			searchResults, searchErr = s.appStoreScraper.SearchKeyword(ctx, tk.Keyword, tk.Country, 50)
-		case model.PlatformAndroid:
-			searchResults, searchErr = s.googlePlayScraper.SearchKeyword(ctx, tk.Keyword, tk.Country, 50)
-		default:
-			results[tk.ID] = -1
-			continue
-		}
-
-		if searchErr != nil {
-			status := scraper.StatusCodeOf(searchErr)
-			log.Printf("tracked keyword update failed: keyword=%q country=%s status=%d: %v", tk.Keyword, tk.Country, status, searchErr)
-			results[tk.ID] = -1
-			continue
-		}
-
-		// Convert to repository format
-		repoResults := make([]repository.SearchResult, len(searchResults))
-		for i, sr := range searchResults {
-			repoResults[i] = repository.SearchResult{
-				Rank:      sr.Rank,
-				AppName:   sr.AppInfo.Name,
-				BundleID:  sr.AppInfo.BundleID,
-				Developer: sr.AppInfo.Developer,
+			count, err := s.updateTrackedKeyword(ctx, tk)
+			if err != nil {
+				log.Printf("tracked keyword update failed: keyword=%q country=%s status=%d: %v",
+					tk.Keyword, tk.Country, scraper.StatusCodeOf(err), err)
+				count = -1
 			}
-		}
 
-		if err := s.trackedKeywordRepo.SaveSearchResults(ctx, tk.ID, repoResults); err != nil {
-			log.Printf("tracked keyword update failed: keyword=%q country=%s: failed to save results: %v", tk.Keyword, tk.Country, err)
-			results[tk.ID] = -1
-			continue
-		}
-
-		results[tk.ID] = len(repoResults)
+			mu.Lock()
+			results[tk.ID] = count
+			mu.Unlock()
+		}(tk)
 	}
+	wg.Wait()
 
 	return results, nil
 }
@@ -415,6 +402,12 @@ func (s *ScraperService) UpdateSingleTrackedKeyword(ctx context.Context, tracked
 		return 0, fmt.Errorf("failed to get tracked keyword: %w", err)
 	}
 
+	return s.updateTrackedKeyword(ctx, tk)
+}
+
+// updateTrackedKeyword searches one tracked keyword and replaces its stored
+// results, returning how many results were saved.
+func (s *ScraperService) updateTrackedKeyword(ctx context.Context, tk *repository.TrackedKeyword) (int, error) {
 	var searchResults []scraper.SearchResult
 	var searchErr error
 

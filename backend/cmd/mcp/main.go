@@ -80,7 +80,7 @@ func newServer(c *Client) *mcp.Server {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "get_rank_history",
 		Description: "指定アプリの順位履歴を日付付きで返す。推移の分析やグラフ化に使う。" +
-			"recorded_at は UTC なので JST に直すには +9 時間。同じ日に複数行あるのは臨時スクレイプが走った場合。",
+			"recorded_at は UTC なので JST に直すには +9 時間。キーワードごとに JST の1日1点（その日の最後の取得値）に集約済み。",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args HistoryArgs) (*mcp.CallToolResult, any, error) {
 		if args.AppID == "" {
 			return toolError(fmt.Errorf("app_id は必須です。list_apps で取得してください")), nil, nil

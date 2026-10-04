@@ -42,13 +42,31 @@ func (r *RankingRepository) Create(ctx context.Context, req *model.CreateRanking
 	return ranking, nil
 }
 
+// rankingJSTDay is the JST calendar date of a ranking_history row. Readers
+// collapse rows to one per keyword per JST day (the latest of the day) because
+// ranking_history can hold several rows for the same day: on-demand scrapes
+// and re-run batches insert without replacing, and the rows are deliberately
+// kept rather than deleted. alias is the ranking_history table alias, if any.
+func jstDayOf(alias string) string {
+	if alias != "" {
+		alias += "."
+	}
+	return "(" + alias + "recorded_at AT TIME ZONE 'Asia/Tokyo')::date"
+}
+
+// ListByKeywordDays returns at most one ranking per JST day (the day's latest)
+// for the last `days` days, oldest first.
 func (r *RankingRepository) ListByKeywordDays(ctx context.Context, keywordID string, days int) ([]*model.RankingHistory, error) {
 	since := time.Now().AddDate(0, 0, -days)
 	query := `
 		SELECT id, keyword_id, rank, recorded_at
-		FROM ranking_history
-		WHERE keyword_id = $1
-		  AND recorded_at >= $2
+		FROM (
+			SELECT DISTINCT ON (` + jstDayOf("") + `) id, keyword_id, rank, recorded_at
+			FROM ranking_history
+			WHERE keyword_id = $1
+			  AND recorded_at >= $2
+			ORDER BY ` + jstDayOf("") + `, recorded_at DESC
+		) daily
 		ORDER BY recorded_at ASC
 	`
 	rows, err := r.pool.Query(ctx, query, keywordID, since)
@@ -68,13 +86,21 @@ func (r *RankingRepository) ListByKeywordDays(ctx context.Context, keywordID str
 	return rankings, nil
 }
 
+// ListByKeyword returns the latest `limit` days of rankings, one per JST day
+// (the day's latest), newest first. Ranking-change detection relies on this
+// to compare today against the previous day rather than against an earlier
+// run of the same day.
 func (r *RankingRepository) ListByKeyword(ctx context.Context, keywordID string, limit int) ([]*model.RankingHistory, error) {
 	query := `
 		SELECT id, keyword_id, rank, recorded_at
-		FROM ranking_history
-		WHERE keyword_id = $1
+		FROM (
+			SELECT DISTINCT ON (` + jstDayOf("") + `) id, keyword_id, rank, recorded_at
+			FROM ranking_history
+			WHERE keyword_id = $1
+			ORDER BY ` + jstDayOf("") + ` DESC, recorded_at DESC
+			LIMIT $2
+		) daily
 		ORDER BY recorded_at DESC
-		LIMIT $2
 	`
 
 	rows, err := r.pool.Query(ctx, query, keywordID, limit)
@@ -98,14 +124,21 @@ func (r *RankingRepository) ListByKeyword(ctx context.Context, keywordID string,
 	return rankings, nil
 }
 
+// ListByAppWithKeyword returns one ranking per keyword per JST day (the
+// day's latest) within [from, to], newest first.
 func (r *RankingRepository) ListByAppWithKeyword(ctx context.Context, appID string, from, to time.Time) ([]*model.RankingWithKeyword, error) {
 	query := `
-		SELECT rh.id, rh.keyword_id, rh.rank, rh.recorded_at, k.keyword, k.country
-		FROM ranking_history rh
-		JOIN keywords k ON rh.keyword_id = k.id
-		WHERE k.app_id = $1
-		AND rh.recorded_at >= $2 AND rh.recorded_at <= $3
-		ORDER BY rh.recorded_at DESC
+		SELECT id, keyword_id, rank, recorded_at, keyword, country
+		FROM (
+			SELECT DISTINCT ON (rh.keyword_id, ` + jstDayOf("rh") + `)
+				rh.id, rh.keyword_id, rh.rank, rh.recorded_at, k.keyword, k.country
+			FROM ranking_history rh
+			JOIN keywords k ON rh.keyword_id = k.id
+			WHERE k.app_id = $1
+			AND rh.recorded_at >= $2 AND rh.recorded_at <= $3
+			ORDER BY rh.keyword_id, ` + jstDayOf("rh") + `, rh.recorded_at DESC
+		) daily
+		ORDER BY recorded_at DESC
 	`
 
 	rows, err := r.pool.Query(ctx, query, appID, from, to)
