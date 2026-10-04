@@ -32,6 +32,9 @@ export type Keyword = {
   country: string
   popularity_score?: number
   popularity_fetched_at?: string
+  /** 'manual' = 人が追加, 'auto' = キーワード自動探索が追加 */
+  source?: 'manual' | 'auto'
+  auto_reason?: string
   created_at: string
 }
 

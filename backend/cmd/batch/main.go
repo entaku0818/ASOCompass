@@ -51,6 +51,11 @@ const itunesSearchInterval = 3 * time.Second
 // store-rankings (~2m) and keyword-cache.
 const itunesSearchBudget = 25 * time.Minute
 
+// keywordDiscoveryBudget bounds the kw-discover job. Its own caps (60 searches
+// + 30 suggestion calls at one per itunesSearchInterval ≈ 4.5 minutes) are
+// what normally end it; this is a backstop.
+const keywordDiscoveryBudget = 10 * time.Minute
+
 func main() {
 	ctx := context.Background()
 	startTime := time.Now()
@@ -168,6 +173,14 @@ func main() {
 		result.TrackedKeywords = tracked
 		result.TrackedKeywordsFailed = failed
 		result.Errors = append(result.Errors, errs...)
+	case "kw-discover":
+		discoverCtx, cancelDiscover := context.WithTimeout(ctx, keywordDiscoveryBudget)
+		discovery := service.NewKeywordDiscoveryService(keywordRepo, rankingRepo, appRepo,
+			repository.NewUserRepository(pool), scraper.NewRateLimiter(itunesSearchInterval))
+		added, errs := runKeywordDiscovery(discoverCtx, discovery)
+		cancelDiscover()
+		result.KeywordsUpdated = added
+		result.Errors = append(result.Errors, errs...)
 	case "keyword-cache":
 		cached, errs := runKeywordCacheUpdate(ctx, keywordCacheRepo)
 		result.KeywordsUpdated = cached
@@ -198,14 +211,14 @@ func main() {
 		result.KeywordsUpdated += cached
 		result.Errors = append(result.Errors, cacheErrs...)
 	default:
-		sendFailureAndExit(fmt.Sprintf("Unknown job: %s. Use: migrate, seed, rankings, store-rankings, tracked-keywords, keyword-cache, or all", job))
+		sendFailureAndExit(fmt.Sprintf("Unknown job: %s. Use: migrate, seed, rankings, store-rankings, tracked-keywords, keyword-cache, kw-discover, or all", job))
 	}
 
 	result.EndTime = time.Now()
 	result.Finalize()
 
 	// Send Slack notification
-	if slackNotifier.IsConfigured() && (job == "all" || job == "rankings" || job == "tracked-keywords") {
+	if slackNotifier.IsConfigured() && (job == "all" || job == "rankings" || job == "tracked-keywords" || job == "kw-discover") {
 		if err := slackNotifier.SendBatchResult(result); err != nil {
 			log.Printf("Failed to send Slack notification: %v", err)
 		} else {
@@ -282,6 +295,28 @@ func runTrackedKeywordsUpdate(ctx context.Context, s *service.ScraperService) (i
 
 	fmt.Printf("Tracked keywords update complete: %d total results across %d keywords (%d failed)\n", total, len(results), failed)
 	return total, failed, errors
+}
+
+func runKeywordDiscovery(ctx context.Context, svc *service.KeywordDiscoveryService) (int, []string) {
+	log.Println("Starting keyword discovery...")
+	result, err := svc.Run(ctx)
+	if err != nil {
+		log.Printf("Keyword discovery error: %v", err)
+		return 0, []string{fmt.Sprintf("Keyword discovery error: %v", err)}
+	}
+	for _, k := range result.Added {
+		rank := "圏外"
+		if k.Rank != nil {
+			rank = fmt.Sprintf("%d位", *k.Rank)
+		}
+		log.Printf("Keyword discovery added: app=%q keyword=%q rank=%s reason=%s", k.AppName, k.Keyword, rank, k.Reason)
+	}
+	for _, e := range result.Errors {
+		log.Printf("Keyword discovery error: %s", e)
+	}
+	fmt.Printf("Keyword discovery complete: %d keywords added (%d searches, %d suggestion calls, %d errors)\n",
+		len(result.Added), result.Searches, result.HintCalls, len(result.Errors))
+	return len(result.Added), result.Errors
 }
 
 func runStoreRankingsFetch(ctx context.Context, svc *service.AppRankingService) (int, []error) {

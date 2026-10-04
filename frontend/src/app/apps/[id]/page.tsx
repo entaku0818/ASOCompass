@@ -111,6 +111,14 @@ function KeywordRow({
             className="rounded border-gray-300 dark:border-gray-600 text-blue-600"
           />
           {keyword.keyword}
+          {keyword.source === 'auto' && (
+            <span
+              className="text-xs px-1.5 py-0.5 rounded bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300"
+              title={keyword.auto_reason ?? '自動追加'}
+            >
+              自動
+            </span>
+          )}
         </div>
       </td>
       <td className="py-3 px-4">{keyword.country}</td>

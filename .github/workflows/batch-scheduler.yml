@@ -4,6 +4,9 @@ on:
   schedule:
     # Run daily at 9:00 JST (0:00 UTC)
     - cron: '0 0 * * *'
+    # Keyword discovery at 18:00 JST (9:00 UTC): a separate job with its own
+    # search budget, so it never eats into the daily rankings run.
+    - cron: '0 9 * * *'
   workflow_dispatch:
     inputs:
       job:
@@ -16,6 +19,7 @@ on:
           - store-rankings
           - tracked-keywords
           - keyword-cache
+          - kw-discover
           - migrate
           - seed
 
@@ -103,7 +107,7 @@ jobs:
       - name: Execute batch job
         env:
           PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          JOB_TYPE: ${{ github.event.inputs.job || 'all' }}
+          JOB_TYPE: ${{ github.event.inputs.job || (github.event.schedule == '0 9 * * *' && 'kw-discover') || 'all' }}
         run: |
           echo "Running batch job: $JOB_TYPE"
           gcloud run jobs execute aso-batch \
@@ -116,13 +120,13 @@ jobs:
         run: |
           echo "## Batch Job Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- Job type: ${{ github.event.inputs.job || 'all' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Job type: ${{ github.event.inputs.job || (github.event.schedule == '0 9 * * *' && 'kw-discover') || 'all' }}" >> $GITHUB_STEP_SUMMARY
           echo "- Completed at: $(date)" >> $GITHUB_STEP_SUMMARY
 
       - name: Notify Slack on Success
         if: success()
         env:
-          JOB_TYPE: ${{ github.event.inputs.job || 'all' }}
+          JOB_TYPE: ${{ github.event.inputs.job || (github.event.schedule == '0 9 * * *' && 'kw-discover') || 'all' }}
           BRANCH_NAME: ${{ github.ref_name }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
@@ -160,7 +164,7 @@ jobs:
       - name: Notify Slack on Failure
         if: failure()
         env:
-          JOB_TYPE: ${{ github.event.inputs.job || 'all' }}
+          JOB_TYPE: ${{ github.event.inputs.job || (github.event.schedule == '0 9 * * *' && 'kw-discover') || 'all' }}
           BRANCH_NAME: ${{ github.ref_name }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

@@ -9,8 +9,17 @@ type Keyword struct {
 	Country             string     `json:"country"`
 	PopularityScore     *int       `json:"popularity_score,omitempty"`
 	PopularityFetchedAt *time.Time `json:"popularity_fetched_at,omitempty"`
-	CreatedAt           time.Time  `json:"created_at"`
+	// Source is KeywordSourceManual for keywords a person added and
+	// KeywordSourceAuto for ones keyword discovery added; AutoReason says why.
+	Source     string    `json:"source"`
+	AutoReason *string   `json:"auto_reason,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
 }
+
+const (
+	KeywordSourceManual = "manual"
+	KeywordSourceAuto   = "auto"
+)
 
 type CreateKeywordRequest struct {
 	AppID   string `json:"app_id"`

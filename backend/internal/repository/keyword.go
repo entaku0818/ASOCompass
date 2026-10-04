@@ -24,6 +24,7 @@ func (r *KeywordRepository) Create(ctx context.Context, req *model.CreateKeyword
 		AppID:   req.AppID,
 		Keyword: req.Keyword,
 		Country: req.Country,
+		Source:  model.KeywordSourceManual,
 	}
 
 	query := `
@@ -45,7 +46,7 @@ func (r *KeywordRepository) Create(ctx context.Context, req *model.CreateKeyword
 
 func (r *KeywordRepository) Get(ctx context.Context, id string) (*model.Keyword, error) {
 	query := `
-		SELECT id, app_id, keyword, country, popularity_score, popularity_fetched_at, created_at
+		SELECT id, app_id, keyword, country, popularity_score, popularity_fetched_at, source, auto_reason, created_at
 		FROM keywords
 		WHERE id = $1
 	`
@@ -53,7 +54,7 @@ func (r *KeywordRepository) Get(ctx context.Context, id string) (*model.Keyword,
 	keyword := &model.Keyword{}
 	err := r.pool.QueryRow(ctx, query, id).Scan(
 		&keyword.ID, &keyword.AppID, &keyword.Keyword, &keyword.Country,
-		&keyword.PopularityScore, &keyword.PopularityFetchedAt, &keyword.CreatedAt,
+		&keyword.PopularityScore, &keyword.PopularityFetchedAt, &keyword.Source, &keyword.AutoReason, &keyword.CreatedAt,
 	)
 
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -68,7 +69,7 @@ func (r *KeywordRepository) Get(ctx context.Context, id string) (*model.Keyword,
 
 func (r *KeywordRepository) ListByApp(ctx context.Context, appID string) ([]*model.Keyword, error) {
 	query := `
-		SELECT id, app_id, keyword, country, popularity_score, popularity_fetched_at, created_at
+		SELECT id, app_id, keyword, country, popularity_score, popularity_fetched_at, source, auto_reason, created_at
 		FROM keywords
 		WHERE app_id = $1
 		ORDER BY created_at DESC
@@ -85,7 +86,7 @@ func (r *KeywordRepository) ListByApp(ctx context.Context, appID string) ([]*mod
 		keyword := &model.Keyword{}
 		err := rows.Scan(
 			&keyword.ID, &keyword.AppID, &keyword.Keyword, &keyword.Country,
-			&keyword.PopularityScore, &keyword.PopularityFetchedAt, &keyword.CreatedAt,
+			&keyword.PopularityScore, &keyword.PopularityFetchedAt, &keyword.Source, &keyword.AutoReason, &keyword.CreatedAt,
 		)
 		if err != nil {
 			return nil, err
@@ -155,6 +156,7 @@ func (r *KeywordRepository) CountAndCreateWithLock(ctx context.Context, req *mod
 		AppID:   req.AppID,
 		Keyword: req.Keyword,
 		Country: req.Country,
+		Source:  model.KeywordSourceManual,
 	}
 
 	if err := tx.QueryRow(ctx,
@@ -208,4 +210,39 @@ func (r *KeywordRepository) Delete(ctx context.Context, id string) error {
 	}
 
 	return nil
+}
+
+// CreateAuto inserts a keyword found by keyword discovery, marked
+// source='auto' with the reason it was adopted. It returns (nil, nil) when the
+// app already has the keyword.
+func (r *KeywordRepository) CreateAuto(ctx context.Context, appID, keyword, country, reason string) (*model.Keyword, error) {
+	k := &model.Keyword{
+		ID:         uuid.New().String(),
+		AppID:      appID,
+		Keyword:    keyword,
+		Country:    country,
+		Source:     model.KeywordSourceAuto,
+		AutoReason: &reason,
+	}
+	err := r.pool.QueryRow(ctx,
+		`INSERT INTO keywords (id, app_id, keyword, country, source, auto_reason, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, NOW())
+		 ON CONFLICT (app_id, keyword, country) DO NOTHING
+		 RETURNING created_at`,
+		k.ID, k.AppID, k.Keyword, k.Country, k.Source, reason,
+	).Scan(&k.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return k, nil
+}
+
+// CountBySource counts keywords across all apps with the given source.
+func (r *KeywordRepository) CountBySource(ctx context.Context, source string) (int, error) {
+	var count int
+	err := r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM keywords WHERE source = $1`, source).Scan(&count)
+	return count, err
 }
