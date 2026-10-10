@@ -38,6 +38,9 @@ var migration016 string
 //go:embed migrations/017_keyword_source.up.sql
 var migration017 string
 
+//go:embed migrations/018_ranking_result_count.up.sql
+var migration018 string
+
 // The iTunes Search API starts refusing requests at roughly 20 per minute. All
 // searches of a run (keyword rankings and tracked keywords) share one limiter
 // at that pace: ~200 ranking keywords + ~210 tracked keywords is ~410
@@ -343,6 +346,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) {
 		{"015_public_keyword_cache", migration015},
 		{"016_search_keyword_reports", migration016},
 		{"017_keyword_source", migration017},
+		{"018_ranking_result_count", migration018},
 	}
 
 	for _, m := range migrations {
