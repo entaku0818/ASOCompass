@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/entaku0818/aso-compass/backend/internal/model"
 	"github.com/entaku0818/aso-compass/backend/internal/scraper"
@@ -120,11 +121,13 @@ func TestPickSeeds(t *testing.T) {
 
 // fakeDiscoveryStore records adds in memory.
 type fakeDiscoveryStore struct {
-	apps      []*model.App
-	keywords  map[string][]*model.Keyword
-	autoCount int
-	pro       bool
-	added     []string
+	apps       []*model.App
+	keywords   map[string][]*model.Keyword
+	autoCount  int
+	todayCount int
+	since      time.Time
+	pro        bool
+	added      []string
 }
 
 func (f *fakeDiscoveryStore) ListApps(ctx context.Context) ([]*model.App, error) { return f.apps, nil }
@@ -133,6 +136,10 @@ func (f *fakeDiscoveryStore) ListKeywords(ctx context.Context, appID string) ([]
 }
 func (f *fakeDiscoveryStore) CountAutoKeywords(ctx context.Context) (int, error) {
 	return f.autoCount, nil
+}
+func (f *fakeDiscoveryStore) CountAutoKeywordsSince(ctx context.Context, since time.Time) (int, error) {
+	f.since = since
+	return f.todayCount, nil
 }
 func (f *fakeDiscoveryStore) IsPro(ctx context.Context, userID string) bool { return f.pro }
 func (f *fakeDiscoveryStore) AddAutoKeyword(ctx context.Context, appID, keyword, country, reason string, rank *int) (*model.Keyword, error) {
@@ -157,6 +164,7 @@ func newFakeDiscovery(store *fakeDiscoveryStore, searcher *fakeSearcher, cfg Key
 		},
 		cfg:  cfg,
 		rand: rand.New(rand.NewSource(1)),
+		now:  time.Now,
 	}
 }
 
@@ -176,8 +184,10 @@ func TestDiscoveryRun_RespectsPerAppAndTotalCaps(t *testing.T) {
 	store, _ := testApps(5)
 	store.autoCount = 37 // 3 left under the total cap of 40
 	searcher := &fakeSearcher{}
+	cfg := DefaultKeywordDiscoveryConfig
+	cfg.MaxAutoKeywordsPerDay = 100 // let the total cap be the one that binds
 
-	result, err := newFakeDiscovery(store, searcher, DefaultKeywordDiscoveryConfig).Run(context.Background())
+	result, err := newFakeDiscovery(store, searcher, cfg).Run(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,6 +210,7 @@ func TestDiscoveryRun_StopsAtSearchBudget(t *testing.T) {
 	cfg := DefaultKeywordDiscoveryConfig
 	cfg.MaxSearchesPerRun = 3
 	cfg.MaxAutoKeywordsTotal = 1000
+	cfg.MaxAutoKeywordsPerDay = 1000
 	searcher := &fakeSearcher{}
 
 	result, err := newFakeDiscovery(store, searcher, cfg).Run(context.Background())
@@ -257,5 +268,38 @@ func TestIsRelevant(t *testing.T) {
 		if got := isRelevant(tt.candidate, terms); got != tt.want {
 			t.Errorf("isRelevant(%q) = %v, want %v (terms %v)", tt.candidate, got, tt.want, terms)
 		}
+	}
+}
+
+func TestDiscoveryRun_RespectsDailyCap(t *testing.T) {
+	store, _ := testApps(5)
+	store.todayCount = 1 // one added earlier today (e.g. by a manual run)
+	searcher := &fakeSearcher{}
+	svc := newFakeDiscovery(store, searcher, DefaultKeywordDiscoveryConfig)
+	svc.now = func() time.Time { return time.Date(2026, 10, 10, 16, 30, 0, 0, time.UTC) } // 10/11 01:30 JST
+
+	result, err := svc.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := DefaultKeywordDiscoveryConfig.MaxAutoKeywordsPerDay - 1; len(result.Added) != want {
+		t.Errorf("added %d, want %d (daily cap %d minus 1 already today)", len(result.Added), want, DefaultKeywordDiscoveryConfig.MaxAutoKeywordsPerDay)
+	}
+	if want := time.Date(2026, 10, 10, 15, 0, 0, 0, time.UTC); !store.since.Equal(want) {
+		t.Errorf("counted since %v, want %v (00:00 JST)", store.since, want)
+	}
+}
+
+func TestDiscoveryRun_DailyCapReachedDoesNothing(t *testing.T) {
+	store, _ := testApps(3)
+	store.todayCount = DefaultKeywordDiscoveryConfig.MaxAutoKeywordsPerDay
+	searcher := &fakeSearcher{}
+
+	result, err := newFakeDiscovery(store, searcher, DefaultKeywordDiscoveryConfig).Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Added) != 0 || searcher.calls != 0 || result.HintCalls != 0 {
+		t.Errorf("added=%d searches=%d hints=%d, want all 0", len(result.Added), searcher.calls, result.HintCalls)
 	}
 }

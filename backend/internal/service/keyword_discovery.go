@@ -21,30 +21,34 @@ import (
 // Every adopted keyword is tracked by the daily rankings batch from then on and
 // costs one iTunes search per day there, so MaxAutoKeywordsTotal is what keeps
 // that batch inside its time budget (keywords are never deleted automatically).
+// MaxAutoKeywordsPerDay paces how fast that total is reached, also across
+// manually re-run discovery jobs on the same day.
 type KeywordDiscoveryConfig struct {
-	MaxSearchesPerRun    int // iTunes searches used to validate candidates
-	MaxHintCallsPerRun   int // App Store search-suggestion calls used to find candidates
-	MaxAddsPerAppPerRun  int
-	MaxAutoKeywordsTotal int // across all apps, ever
-	SeedsPerApp          int // suggestion calls per app per run
-	ValidationsPerApp    int // searches per app per run
-	AdoptRankWithin      int // adopt when the app already ranks this high or better
-	WeakTopN             int // how many top results define "the competition"
-	WeakMedianRatings    int // adopt when the top results' median rating count is at most this
-	MaxKeywordRunes      int // longer suggestions are app names, not search terms
+	MaxSearchesPerRun     int // iTunes searches used to validate candidates
+	MaxHintCallsPerRun    int // App Store search-suggestion calls used to find candidates
+	MaxAddsPerAppPerRun   int
+	MaxAutoKeywordsTotal  int // across all apps, ever
+	MaxAutoKeywordsPerDay int // across all apps and runs, per JST calendar day
+	SeedsPerApp           int // suggestion calls per app per run
+	ValidationsPerApp     int // searches per app per run
+	AdoptRankWithin       int // adopt when the app already ranks this high or better
+	WeakTopN              int // how many top results define "the competition"
+	WeakMedianRatings     int // adopt when the top results' median rating count is at most this
+	MaxKeywordRunes       int // longer suggestions are app names, not search terms
 }
 
 var DefaultKeywordDiscoveryConfig = KeywordDiscoveryConfig{
-	MaxSearchesPerRun:    60,
-	MaxHintCallsPerRun:   30,
-	MaxAddsPerAppPerRun:  2,
-	MaxAutoKeywordsTotal: 40,
-	SeedsPerApp:          3,
-	ValidationsPerApp:    5,
-	AdoptRankWithin:      50,
-	WeakTopN:             10,
-	WeakMedianRatings:    50,
-	MaxKeywordRunes:      15,
+	MaxSearchesPerRun:     60,
+	MaxHintCallsPerRun:    30,
+	MaxAddsPerAppPerRun:   2,
+	MaxAutoKeywordsTotal:  40,
+	MaxAutoKeywordsPerDay: 3,
+	SeedsPerApp:           3,
+	ValidationsPerApp:     5,
+	AdoptRankWithin:       50,
+	WeakTopN:              10,
+	WeakMedianRatings:     50,
+	MaxKeywordRunes:       15,
 }
 
 // discoveryStore is the persistence KeywordDiscoveryService needs.
@@ -52,6 +56,7 @@ type discoveryStore interface {
 	ListApps(ctx context.Context) ([]*model.App, error)
 	ListKeywords(ctx context.Context, appID string) ([]*model.Keyword, error)
 	CountAutoKeywords(ctx context.Context) (int, error)
+	CountAutoKeywordsSince(ctx context.Context, since time.Time) (int, error)
 	IsPro(ctx context.Context, userID string) bool
 	AddAutoKeyword(ctx context.Context, appID, keyword, country, reason string, rank *int) (*model.Keyword, error)
 }
@@ -71,6 +76,7 @@ type KeywordDiscoveryService struct {
 	limiter  *scraper.RateLimiter
 	cfg      KeywordDiscoveryConfig
 	rand     *rand.Rand
+	now      func() time.Time
 }
 
 func NewKeywordDiscoveryService(
@@ -90,7 +96,16 @@ func NewKeywordDiscoveryService(
 		cfg:      DefaultKeywordDiscoveryConfig,
 		// Seeds and app order vary from run to run so different corners get explored.
 		rand: rand.New(rand.NewSource(time.Now().UnixNano())),
+		now:  time.Now,
 	}
+}
+
+var jst = time.FixedZone("JST", 9*60*60)
+
+// startOfJSTDay is 00:00 JST of the day t falls on.
+func startOfJSTDay(t time.Time) time.Time {
+	y, m, d := t.In(jst).Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, jst)
 }
 
 // DiscoveredKeyword is one keyword a run added.
@@ -120,6 +135,18 @@ func (s *KeywordDiscoveryService) Run(ctx context.Context) (*KeywordDiscoveryRes
 	remaining := s.cfg.MaxAutoKeywordsTotal - autoCount
 	if remaining <= 0 {
 		log.Printf("keyword discovery: %d auto keywords already, cap %d reached", autoCount, s.cfg.MaxAutoKeywordsTotal)
+		return result, nil
+	}
+
+	todayCount, err := s.store.CountAutoKeywordsSince(ctx, startOfJSTDay(s.now()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to count today's auto keywords: %w", err)
+	}
+	if left := s.cfg.MaxAutoKeywordsPerDay - todayCount; left < remaining {
+		remaining = left
+	}
+	if remaining <= 0 {
+		log.Printf("keyword discovery: %d auto keywords added today already, daily cap %d reached", todayCount, s.cfg.MaxAutoKeywordsPerDay)
 		return result, nil
 	}
 
@@ -473,6 +500,10 @@ func (r *repoDiscoveryStore) ListKeywords(ctx context.Context, appID string) ([]
 
 func (r *repoDiscoveryStore) CountAutoKeywords(ctx context.Context) (int, error) {
 	return r.keywordRepo.CountBySource(ctx, model.KeywordSourceAuto)
+}
+
+func (r *repoDiscoveryStore) CountAutoKeywordsSince(ctx context.Context, since time.Time) (int, error) {
+	return r.keywordRepo.CountBySourceSince(ctx, model.KeywordSourceAuto, since)
 }
 
 func (r *repoDiscoveryStore) IsPro(ctx context.Context, userID string) bool {

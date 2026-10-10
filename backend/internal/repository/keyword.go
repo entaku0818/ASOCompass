@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/entaku0818/aso-compass/backend/internal/model"
 	"github.com/google/uuid"
@@ -244,5 +245,13 @@ func (r *KeywordRepository) CreateAuto(ctx context.Context, appID, keyword, coun
 func (r *KeywordRepository) CountBySource(ctx context.Context, source string) (int, error) {
 	var count int
 	err := r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM keywords WHERE source = $1`, source).Scan(&count)
+	return count, err
+}
+
+// CountBySourceSince counts keywords of the given source created at or after since.
+func (r *KeywordRepository) CountBySourceSince(ctx context.Context, source string, since time.Time) (int, error) {
+	var count int
+	err := r.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM keywords WHERE source = $1 AND created_at >= $2`, source, since).Scan(&count)
 	return count, err
 }
