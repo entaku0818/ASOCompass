@@ -47,6 +47,9 @@ var migration018 string
 // searches, i.e. ~21 minutes.
 const itunesSearchInterval = 3 * time.Second
 
+// Rechecks of suspicious null ranks (see service.maxRechecks) add at most 20
+// more searches, ~1 minute at this pace.
+//
 // itunesSearchBudget caps how long the iTunes-search phases may run, counted
 // from batch start, so that a slow run ends with its unfinished keywords
 // reported as failures instead of being killed by the Cloud Run task timeout
@@ -269,7 +272,8 @@ func runRankingsUpdate(ctx context.Context, s *service.ScraperService) (int, int
 		}
 	}
 
-	fmt.Printf("Rankings update complete: %d total keywords updated across %d apps (%d failed)\n", result.Updated, len(result.Apps), result.Failed)
+	fmt.Printf("Rankings update complete: %d total keywords updated across %d apps (%d failed, %d rechecked, %d recovered by recheck)\n",
+		result.Updated, len(result.Apps), result.Failed, result.Rechecked, result.Recovered)
 	return len(result.Apps) - failedApps, result.Updated, result.Failed, errors
 }
 

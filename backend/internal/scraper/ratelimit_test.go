@@ -179,3 +179,21 @@ func TestGetAppRanking_RetriesGoThroughLimiter(t *testing.T) {
 		t.Errorf("3 attempts took %v, want at least %v", got, 2*interval)
 	}
 }
+
+func TestGetAppRankingWithCount_ReportsResultCount(t *testing.T) {
+	server, _ := rankingServer(t)
+	s := newTestScraper(server.URL)
+
+	rank, count, err := s.GetAppRankingWithCount(context.Background(), "com.target", "kw", "jp")
+	if err != nil {
+		t.Fatalf("GetAppRankingWithCount() error = %v", err)
+	}
+	if rank == nil || *rank != 2 || count != 2 {
+		t.Errorf("rank/count = %v/%d, want 2/2", rank, count)
+	}
+
+	rank, count, err = s.GetAppRankingWithCount(context.Background(), "com.absent", "kw", "jp")
+	if err != nil || rank != nil || count != 2 {
+		t.Errorf("absent app: rank/count/err = %v/%d/%v, want nil/2/nil", rank, count, err)
+	}
+}

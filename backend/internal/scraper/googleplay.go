@@ -121,19 +121,26 @@ func (s *GooglePlayScraper) GetReviews(ctx context.Context, appID string, countr
 
 // GetAppRanking finds the rank of an app for a specific keyword
 func (s *GooglePlayScraper) GetAppRanking(ctx context.Context, bundleID string, keyword string, country string) (*int, error) {
+	rank, _, err := s.GetAppRankingWithCount(ctx, bundleID, keyword, country)
+	return rank, err
+}
+
+// GetAppRankingWithCount is GetAppRanking plus how many results the search
+// returned.
+func (s *GooglePlayScraper) GetAppRankingWithCount(ctx context.Context, bundleID string, keyword string, country string) (*int, int, error) {
 	results, err := s.SearchKeyword(ctx, keyword, country, 100)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	for _, result := range results {
 		if result.AppInfo.BundleID == bundleID {
 			rank := result.Rank
-			return &rank, nil
+			return &rank, len(results), nil
 		}
 	}
 
-	return nil, nil
+	return nil, len(results), nil
 }
 
 // parseAppPage extracts app info from Google Play HTML page

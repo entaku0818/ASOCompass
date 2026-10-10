@@ -12,6 +12,8 @@ type RankingHistory struct {
 type CreateRankingRequest struct {
 	KeywordID string `json:"keyword_id"`
 	Rank      *int   `json:"rank"`
+	// ResultCount is how many results the search returned; nil when unknown.
+	ResultCount *int `json:"result_count,omitempty"`
 }
 
 func (r *CreateRankingRequest) Validate() error {

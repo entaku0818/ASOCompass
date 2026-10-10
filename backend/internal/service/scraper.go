@@ -120,29 +120,112 @@ type RankingUpdateResult struct {
 	Updated  int
 	Failed   int
 	Failures []KeywordFailure
+	// Rechecked counts keywords searched a second time because the first
+	// search came back null; Recovered is how many of those got a rank.
+	Rechecked int
+	Recovered int
 }
 
 type rankingJob struct {
 	app     *model.App
 	keyword *model.Keyword
+	// prev is the keyword's latest recorded ranking, nil if it has none.
+	prev *repository.LatestRanking
+}
+
+// rankResult is one search's answer: the app's rank (nil when it is not in
+// the results) and how many results the search returned.
+type rankResult struct {
+	Rank        *int
+	ResultCount int
+}
+
+// A null rank right after a good one is often the iTunes Search API answering
+// one request from a different (stale or partial) index: on 2026-10-10 two
+// searches for the same app and keyword a minute apart gave null and 12th.
+// So a null for a keyword that was ranked at most recheckMaxPrevRank last
+// time, or a null from an unusually short result list, is searched once more
+// at the end of the run and the better answer is kept.
+const (
+	recheckMaxPrevRank = 50
+	// maxRechecks caps the extra searches of one run so a bad day costs at most
+	// maxRechecks × the search interval (20 × 3s = 1 minute) of the batch's
+	// search budget.
+	maxRechecks = 20
+)
+
+// shortResultList reports whether count is too few results to trust a null
+// rank from: no results for a keyword that had a rank or results last time,
+// or fewer than half of last time's results.
+func shortResultList(prev *repository.LatestRanking, count int) bool {
+	if prev == nil {
+		return false
+	}
+	if count == 0 && (prev.Rank != nil || (prev.ResultCount != nil && *prev.ResultCount > 0)) {
+		return true
+	}
+	return prev.ResultCount != nil && count*2 < *prev.ResultCount
+}
+
+// needsRecheck reports whether a successful search result should be searched
+// again before it is stored.
+func needsRecheck(job rankingJob, res rankResult) bool {
+	if res.Rank != nil || job.prev == nil {
+		return false
+	}
+	if job.prev.Rank != nil && *job.prev.Rank <= recheckMaxPrevRank {
+		return true
+	}
+	return shortResultList(job.prev, res.ResultCount)
+}
+
+// betterResult picks the answer to keep out of two searches: a rank beats no
+// rank and a higher rank beats a lower one; between two nulls, the longer
+// result list is the more trustworthy.
+func betterResult(a, b rankResult) rankResult {
+	switch {
+	case a.Rank == nil && b.Rank == nil:
+		if b.ResultCount > a.ResultCount {
+			return b
+		}
+		return a
+	case a.Rank == nil:
+		return b
+	case b.Rank == nil:
+		return a
+	case *b.Rank < *a.Rank:
+		return b
+	}
+	return a
 }
 
 // orderByStaleness sorts jobs so the keyword fetched longest ago (or never)
 // goes first. Apps used to be processed newest-registered first, which left
 // the oldest apps' keywords at the end of the run where the rate limit had
 // already kicked in; this way whatever gets dropped differs day to day.
-func orderByStaleness(jobs []rankingJob, lastFetched map[string]time.Time) {
+func orderByStaleness(jobs []rankingJob) {
+	lastFetched := func(j rankingJob) time.Time {
+		if j.prev == nil {
+			return time.Time{}
+		}
+		return j.prev.RecordedAt
+	}
 	sort.SliceStable(jobs, func(i, j int) bool {
-		return lastFetched[jobs[i].keyword.ID].Before(lastFetched[jobs[j].keyword.ID])
+		return lastFetched(jobs[i]).Before(lastFetched(jobs[j]))
 	})
 }
 
-type rankFetcher func(ctx context.Context, job rankingJob) (*int, error)
-type rankStorer func(ctx context.Context, job rankingJob, rank *int) error
+type rankFetcher func(ctx context.Context, job rankingJob) (rankResult, error)
+type rankStorer func(ctx context.Context, job rankingJob, res rankResult) error
 
 // runRankingJobs fetches and stores the rank of every job with bounded
 // concurrency, counting each job as updated or failed. Failures are logged
 // with their HTTP status so a rate-limited run is visible in the batch log.
+//
+// Nulls that needsRecheck flags are held back and searched again after every
+// other keyword, so the second search comes minutes after the first rather
+// than right behind it. A null that still rests on a short result list is not
+// stored: it is counted as a failure instead of being recorded as out of range.
 func runRankingJobs(ctx context.Context, jobs []rankingJob, concurrency int, fetch rankFetcher, store rankStorer) *RankingUpdateResult {
 	result := &RankingUpdateResult{Apps: make(map[string]*AppRankingResult)}
 	for _, job := range jobs {
@@ -155,71 +238,180 @@ func runRankingJobs(ctx context.Context, jobs []rankingJob, concurrency int, fet
 	}
 
 	var (
-		mu  sync.Mutex
+		mu      sync.Mutex
+		recheck []pendingRecheck
+	)
+
+	finish := func(job rankingJob, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		appResult := result.Apps[job.app.ID]
+		if err != nil {
+			failure := KeywordFailure{
+				AppID:      job.app.ID,
+				AppName:    job.app.Name,
+				KeywordID:  job.keyword.ID,
+				Keyword:    job.keyword.Keyword,
+				Country:    job.keyword.Country,
+				StatusCode: scraper.StatusCodeOf(err),
+				Err:        err,
+			}
+			log.Printf("ranking update failed: %s", failure)
+			result.Failures = append(result.Failures, failure)
+			result.Failed++
+			appResult.Failed++
+			return
+		}
+		result.Updated++
+		appResult.Updated++
+	}
+
+	// settle stores res unless it is a null resting on a short result list.
+	settle := func(ctx context.Context, job rankingJob, res rankResult) error {
+		if res.Rank == nil && shortResultList(job.prev, res.ResultCount) {
+			return fmt.Errorf("not recorded: search returned only %d results (previous run: %s)",
+				res.ResultCount, formatCount(job.prev.ResultCount))
+		}
+		if err := store(ctx, job, res); err != nil {
+			return fmt.Errorf("failed to store ranking: %w", err)
+		}
+		return nil
+	}
+
+	forEach(jobs, concurrency, func(job rankingJob) {
+		res, err := fetch(ctx, job)
+		if err == nil && needsRecheck(job, res) {
+			mu.Lock()
+			queued := len(recheck) < maxRechecks
+			if queued {
+				recheck = append(recheck, pendingRecheck{job: job, first: res})
+			}
+			mu.Unlock()
+			if queued {
+				return
+			}
+		}
+		if err == nil {
+			err = settle(ctx, job, res)
+		}
+		finish(job, err)
+	})
+
+	pending := make([]rankingJob, len(recheck))
+	firsts := make(map[string]rankResult, len(recheck))
+	for i, r := range recheck {
+		pending[i] = r.job
+		firsts[r.job.keyword.ID] = r.first
+	}
+	forEach(pending, concurrency, func(job rankingJob) {
+		first := firsts[job.keyword.ID]
+		res, err := fetch(ctx, job)
+		chosen := first
+		if err == nil {
+			chosen = betterResult(first, res)
+			log.Printf("ranking recheck: app=%q keyword=%q first=%s second=%s kept=%s",
+				job.app.Name, job.keyword.Keyword, first, res, chosen)
+		} else {
+			// The first search did succeed; keep its answer rather than lose the keyword.
+			log.Printf("ranking recheck: app=%q keyword=%q second search failed, keeping first=%s: %v",
+				job.app.Name, job.keyword.Keyword, first, err)
+		}
+		mu.Lock()
+		result.Rechecked++
+		if chosen.Rank != nil {
+			result.Recovered++
+		}
+		mu.Unlock()
+		finish(job, settle(ctx, job, chosen))
+	})
+
+	return result
+}
+
+type pendingRecheck struct {
+	job   rankingJob
+	first rankResult
+}
+
+// forEach runs fn on every job, at most concurrency at a time.
+func forEach(jobs []rankingJob, concurrency int, fn func(rankingJob)) {
+	var (
 		wg  sync.WaitGroup
 		sem = make(chan struct{}, concurrency)
 	)
-
 	for _, job := range jobs {
 		wg.Add(1)
 		go func(job rankingJob) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-
-			rank, err := fetch(ctx, job)
-			if err == nil {
-				err = store(ctx, job, rank)
-				if err != nil {
-					err = fmt.Errorf("failed to store ranking: %w", err)
-				}
-			}
-
-			mu.Lock()
-			defer mu.Unlock()
-			appResult := result.Apps[job.app.ID]
-			if err != nil {
-				failure := KeywordFailure{
-					AppID:      job.app.ID,
-					AppName:    job.app.Name,
-					KeywordID:  job.keyword.ID,
-					Keyword:    job.keyword.Keyword,
-					Country:    job.keyword.Country,
-					StatusCode: scraper.StatusCodeOf(err),
-					Err:        err,
-				}
-				log.Printf("ranking update failed: %s", failure)
-				result.Failures = append(result.Failures, failure)
-				result.Failed++
-				appResult.Failed++
-				return
-			}
-			result.Updated++
-			appResult.Updated++
+			fn(job)
 		}(job)
 	}
 	wg.Wait()
-
-	return result
 }
 
-func (s *ScraperService) fetchRank(ctx context.Context, job rankingJob) (*int, error) {
+func (r rankResult) String() string {
+	rank := "null"
+	if r.Rank != nil {
+		rank = fmt.Sprintf("%d", *r.Rank)
+	}
+	return fmt.Sprintf("%s(%d results)", rank, r.ResultCount)
+}
+
+func formatCount(c *int) string {
+	if c == nil {
+		return "unknown"
+	}
+	return fmt.Sprintf("%d results", *c)
+}
+
+func (s *ScraperService) fetchRank(ctx context.Context, job rankingJob) (rankResult, error) {
+	var (
+		rank  *int
+		count int
+		err   error
+	)
 	switch job.app.Platform {
 	case model.PlatformIOS:
-		return s.appStoreScraper.GetAppRanking(ctx, job.app.BundleID, job.keyword.Keyword, job.keyword.Country)
+		rank, count, err = s.appStoreScraper.GetAppRankingWithCount(ctx, job.app.BundleID, job.keyword.Keyword, job.keyword.Country)
 	case model.PlatformAndroid:
-		return s.googlePlayScraper.GetAppRanking(ctx, job.app.BundleID, job.keyword.Keyword, job.keyword.Country)
+		rank, count, err = s.googlePlayScraper.GetAppRankingWithCount(ctx, job.app.BundleID, job.keyword.Keyword, job.keyword.Country)
 	default:
-		return nil, fmt.Errorf("unsupported platform: %s", job.app.Platform)
+		err = fmt.Errorf("unsupported platform: %s", job.app.Platform)
 	}
+	return rankResult{Rank: rank, ResultCount: count}, err
 }
 
-func (s *ScraperService) storeRank(ctx context.Context, job rankingJob, rank *int) error {
+func (s *ScraperService) storeRank(ctx context.Context, job rankingJob, res rankResult) error {
+	count := res.ResultCount
 	_, err := s.rankingRepo.Create(ctx, &model.CreateRankingRequest{
-		KeywordID: job.keyword.ID,
-		Rank:      rank,
+		KeywordID:   job.keyword.ID,
+		Rank:        res.Rank,
+		ResultCount: &count,
 	})
 	return err
+}
+
+// latestRankings loads every keyword's latest ranking, or nil (logged) when it
+// cannot: ordering and rechecks are aids, so a run goes ahead without them.
+func (s *ScraperService) latestRankings(ctx context.Context) map[string]repository.LatestRanking {
+	latest, err := s.rankingRepo.LatestByKeyword(ctx)
+	if err != nil {
+		log.Printf("ranking update: failed to load latest rankings, skipping staleness order and rechecks: %v", err)
+		return nil
+	}
+	return latest
+}
+
+// withPrev attaches each job's latest ranking from latest.
+func withPrev(jobs []rankingJob, latest map[string]repository.LatestRanking) {
+	for i := range jobs {
+		if l, ok := latest[jobs[i].keyword.ID]; ok {
+			l := l
+			jobs[i].prev = &l
+		}
+	}
 }
 
 // UpdateKeywordRankings fetches and stores rankings for all keywords of an app.
@@ -239,6 +431,7 @@ func (s *ScraperService) UpdateKeywordRankings(ctx context.Context, appID string
 	for i, keyword := range keywords {
 		jobs[i] = rankingJob{app: app, keyword: keyword}
 	}
+	withPrev(jobs, s.latestRankings(ctx))
 
 	result := runRankingJobs(ctx, jobs, rankingFetchConcurrency, s.fetchRank, s.storeRank)
 	return result.Updated, nil
@@ -332,12 +525,9 @@ func (s *ScraperService) TriggerAllUpdates(ctx context.Context) (*RankingUpdateR
 		}
 	}
 
-	lastFetched, err := s.rankingRepo.LastRecordedAtByKeyword(ctx)
-	if err != nil {
-		// Ordering is only a fairness aid; fetch in listing order rather than not at all.
-		log.Printf("ranking update: failed to load last fetch times, keeping app order: %v", err)
-	} else {
-		orderByStaleness(jobs, lastFetched)
+	if latest := s.latestRankings(ctx); latest != nil {
+		withPrev(jobs, latest)
+		orderByStaleness(jobs)
 	}
 
 	result := runRankingJobs(ctx, jobs, rankingFetchConcurrency, s.fetchRank, s.storeRank)

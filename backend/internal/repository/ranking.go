@@ -26,13 +26,13 @@ func (r *RankingRepository) Create(ctx context.Context, req *model.CreateRanking
 	}
 
 	query := `
-		INSERT INTO ranking_history (id, keyword_id, rank, recorded_at)
-		VALUES ($1, $2, $3, NOW())
+		INSERT INTO ranking_history (id, keyword_id, rank, result_count, recorded_at)
+		VALUES ($1, $2, $3, $4, NOW())
 		RETURNING recorded_at
 	`
 
 	err := r.pool.QueryRow(ctx, query,
-		ranking.ID, ranking.KeywordID, ranking.Rank,
+		ranking.ID, ranking.KeywordID, ranking.Rank, req.ResultCount,
 	).Scan(&ranking.RecordedAt)
 
 	if err != nil {
@@ -370,28 +370,35 @@ func (r *RankingRepository) GetAllKeywordRanks(ctx context.Context, appID string
 	return summarizeKeywordRanks(raw), nil
 }
 
-// LastRecordedAtByKeyword returns, for every keyword that has any ranking
-// history, when its latest ranking was recorded. The batch uses it to fetch
-// the stalest keywords first.
-func (r *RankingRepository) LastRecordedAtByKeyword(ctx context.Context) (map[string]time.Time, error) {
+// LatestRanking is the most recent ranking_history row of a keyword.
+type LatestRanking struct {
+	RecordedAt  time.Time
+	Rank        *int
+	ResultCount *int
+}
+
+// LatestByKeyword returns, for every keyword that has any ranking history, its
+// latest row. The batch uses it to fetch the stalest keywords first and to
+// decide whether a null rank is worth searching again.
+func (r *RankingRepository) LatestByKeyword(ctx context.Context) (map[string]LatestRanking, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT keyword_id, MAX(recorded_at)
+		SELECT DISTINCT ON (keyword_id) keyword_id, recorded_at, rank, result_count
 		FROM ranking_history
-		GROUP BY keyword_id
+		ORDER BY keyword_id, recorded_at DESC
 	`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	last := make(map[string]time.Time)
+	latest := make(map[string]LatestRanking)
 	for rows.Next() {
 		var keywordID string
-		var recordedAt time.Time
-		if err := rows.Scan(&keywordID, &recordedAt); err != nil {
+		var l LatestRanking
+		if err := rows.Scan(&keywordID, &l.RecordedAt, &l.Rank, &l.ResultCount); err != nil {
 			return nil, err
 		}
-		last[keywordID] = recordedAt
+		latest[keywordID] = l
 	}
-	return last, rows.Err()
+	return latest, rows.Err()
 }

@@ -373,13 +373,21 @@ func (s *AppStoreScraper) GetReviews(ctx context.Context, appID string, country 
 
 // GetAppRanking finds the rank of an app for a specific keyword
 func (s *AppStoreScraper) GetAppRanking(ctx context.Context, bundleID string, keyword string, country string) (*int, error) {
+	rank, _, err := s.GetAppRankingWithCount(ctx, bundleID, keyword, country)
+	return rank, err
+}
+
+// GetAppRankingWithCount is GetAppRanking plus how many results the search
+// returned, so a caller can tell "not in a full result list" apart from "the
+// store answered with an unusually short list".
+func (s *AppStoreScraper) GetAppRankingWithCount(ctx context.Context, bundleID string, keyword string, country string) (*int, int, error) {
 	var result iTunesRankingResponse
 	if err := s.searchInto(ctx, keyword, country, 200, &result); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	// nil when the app does not appear in the search results
-	return result.rankOf(bundleID), nil
+	return result.rankOf(bundleID), len(result.Results), nil
 }
 
 func (s *AppStoreScraper) convertToAppInfo(result *iTunesResult) *AppInfo {
