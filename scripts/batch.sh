@@ -36,5 +36,15 @@ gcloud run jobs execute aso-batch \
   --args "$JOB_TYPE" \
   --wait
 
+# "all" no longer includes tracked keywords; run them as their own execution
+# afterwards, the same way the scheduler does.
+if [ "$JOB_TYPE" = "all" ]; then
+  echo "Executing batch job: tracked-keywords"
+  gcloud run jobs execute aso-batch \
+    --region $REGION \
+    --args tracked-keywords \
+    --wait
+fi
+
 echo ""
 echo "=== Done ==="

@@ -55,6 +55,7 @@ jobs:
           docker push asia-northeast1-docker.pkg.dev/$PROJECT_ID/aso-tool/batch:latest
 
       - name: Create or update Cloud Run Job
+        id: deploy_job
         env:
           PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           ADMIN_ASA_CLIENT_ID: ${{ secrets.ADMIN_ASA_CLIENT_ID }}
@@ -113,6 +114,19 @@ jobs:
           gcloud run jobs execute aso-batch \
             --region asia-northeast1 \
             --args "$JOB_TYPE" \
+            --wait
+
+      # "all" no longer includes tracked keywords: they run as their own
+      # execution afterwards, so each has its own search budget and 30m task
+      # timeout, and the two never hit the iTunes rate limit at the same time.
+      # Runs even if "all" failed, as long as the job itself was deployed.
+      - name: Execute tracked-keywords job
+        if: ${{ always() && steps.deploy_job.outcome == 'success' && (github.event.inputs.job || (github.event.schedule == '0 9 * * *' && 'kw-discover') || 'all') == 'all' }}
+        run: |
+          echo "Running batch job: tracked-keywords"
+          gcloud run jobs execute aso-batch \
+            --region asia-northeast1 \
+            --args tracked-keywords \
             --wait
 
       - name: Summary

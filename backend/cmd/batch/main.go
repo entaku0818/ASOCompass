@@ -42,14 +42,14 @@ var migration017 string
 var migration018 string
 
 // The iTunes Search API starts refusing requests at roughly 20 per minute. All
-// searches of a run (keyword rankings and tracked keywords) share one limiter
-// at that pace: ~200 ranking keywords + ~210 tracked keywords is ~410
-// searches, i.e. ~21 minutes.
+// searches of a run share one limiter at that pace: ~250 ranking keywords plus
+// at most 20 rechecks of suspicious null ranks (see service.maxRechecks) is
+// ~270 searches, i.e. ~13.5 minutes. Tracked keywords (~210 searches, ~10.5
+// minutes) are not part of "all": the scheduler runs them as their own
+// execution right after it, so each gets the whole budget below and the two
+// never search at the same time.
 const itunesSearchInterval = 3 * time.Second
 
-// Rechecks of suspicious null ranks (see service.maxRechecks) add at most 20
-// more searches, ~1 minute at this pace.
-//
 // itunesSearchBudget caps how long the iTunes-search phases may run, counted
 // from batch start, so that a slow run ends with its unfinished keywords
 // reported as failures instead of being killed by the Cloud Run task timeout
@@ -192,7 +192,7 @@ func main() {
 		result.KeywordsUpdated = cached
 		result.Errors = append(result.Errors, errs...)
 	case "all":
-		// Rankings go first so they get the search budget before tracked keywords.
+		// Tracked keywords are a separate execution (see itunesSearchInterval).
 		apps, keywords, failed, errs := runRankingsUpdate(searchCtx, scraperService)
 		result.AppsProcessed = apps
 		result.KeywordsUpdated = keywords
@@ -201,11 +201,6 @@ func main() {
 		// Detect ranking changes after update
 		changes, _ := rankingChangeService.DetectChanges(ctx)
 		result.RankingChanges = changes
-
-		tracked, trackedFailed, trackedErrs := runTrackedKeywordsUpdate(searchCtx, scraperService)
-		result.TrackedKeywords = tracked
-		result.TrackedKeywordsFailed = trackedFailed
-		result.Errors = append(result.Errors, trackedErrs...)
 
 		saved, storeErrs := runStoreRankingsFetch(ctx, appRankingService)
 		result.KeywordsUpdated += saved
